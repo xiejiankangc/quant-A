@@ -298,18 +298,20 @@ def boards(kind: str) -> list[dict[str, Any]]:
     """东财行业/概念板块列表。
 
     kind 只接受 `industry`（行业板块）或 `concept`（概念板块）。
-    返回字段：code/name/price/change_pct/amount/turnover_rate/delayed/transport。
+    返回字段：code/name/price/change_pct/volume/amount/turnover_rate/
+    delayed/transport。
     """
     fs = {"industry": "m:90+t:2+f:!50", "concept": "m:90+t:3+f:!50"}.get(kind)
     if fs is None:
         raise ValueError(f"kind 只支持 industry/concept，收到: {kind!r}")
-    rows = _clist(fs, "f12,f14,f2,f3,f6,f8")
+    rows = _clist(fs, "f12,f14,f2,f3,f5,f6,f8")
     return [
         {
             "code": row.get("f12"),
             "name": row.get("f14"),
             "price": _num(row.get("f2")),
             "change_pct": _num(row.get("f3")),
+            "volume": _num(row.get("f5")),
             "amount": _num(row.get("f6")),
             "turnover_rate": _num(row.get("f8")),
             "delayed": row.get("_delayed"),

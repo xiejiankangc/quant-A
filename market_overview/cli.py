@@ -34,7 +34,7 @@ def _parser() -> argparse.ArgumentParser:
         "--focus-boards",
         type=int,
         default=5,
-        help="按当日涨跌幅绝对值选取并抓取历史/成分的重点板块数",
+        help="按当日涨跌幅绝对值选取并抓取历史/成分的重点板块数（东财与同花顺各取）",
     )
     fetch.add_argument(
         "--watch-boards",
@@ -48,6 +48,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     fetch.add_argument("--skip-breadth", action="store_true")
     fetch.add_argument("--skip-special", action="store_true")
+    fetch.add_argument(
+        "--em-history",
+        action="store_true",
+        help="尝试东财板块原生日线历史回填；接口受网络风控时失败仅记警告，不影响流程",
+    )
 
     report = sub.add_parser("report", help="从规范仓库渲染 Markdown 报告")
     report.add_argument("--portfolio", help="组合 JSON 路径（可选）")
@@ -100,6 +105,7 @@ def main() -> None:
             extra_symbols=symbols,
             include_breadth=not args.skip_breadth,
             include_special=not args.skip_special,
+            em_history=args.em_history,
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     elif args.command == "report":
@@ -118,6 +124,13 @@ def main() -> None:
             "fetch_log",
         ):
             print(f"{table:28s} {store.table_count(table)}")
+        print("")
+        print("board_daily 来源分布（kind / source / 行数）")
+        for kind, source, count in store.query_df(
+            "SELECT kind, source, count(*) AS n FROM board_daily "
+            "GROUP BY kind, source ORDER BY kind, source"
+        ).itertuples(index=False):
+            print(f"  {kind:10s} {source:28s} {int(count)}")
     else:
         raise SystemExit("未知命令")
 

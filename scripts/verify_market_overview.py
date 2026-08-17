@@ -40,6 +40,7 @@ def main() -> None:
     parser.add_argument("--out", default="data/reports/verify_report.md")
     parser.add_argument("--skip-breadth", action="store_true")
     parser.add_argument("--skip-special", action="store_true")
+    parser.add_argument("--em-history", action="store_true")
     args = parser.parse_args()
 
     portfolio = Portfolio.from_file(args.portfolio) if args.portfolio else None
@@ -61,8 +62,13 @@ def main() -> None:
         extra_symbols=symbols,
         include_breadth=not args.skip_breadth,
         include_special=not args.skip_special,
+        em_history=args.em_history,
     )
-    print(f"  抓取项 {len(summary.get('artifacts', {}))}，失败项 {len(summary.get('errors', {}))}")
+    print(
+        f"  抓取项 {len(summary.get('artifacts', {}))}，"
+        f"失败项 {len(summary.get('errors', {}))}，"
+        f"可选降级 {len(summary.get('warnings', {}))}"
+    )
 
     print("[market_overview] 渲染报告…")
     out = render(args.db, portfolio, args.out)
@@ -79,6 +85,29 @@ def main() -> None:
     for table, count in required.items():
         print(f"  {table}: {count}")
 
+    em_snapshot = store.query_df(
+        "SELECT kind, count(*) AS n FROM board_daily "
+        "WHERE source = 'eastmoney-board-snapshot' GROUP BY kind"
+    )
+    em_constituents_frame = store.query_df(
+        "SELECT count(*) AS n FROM board_constituent_daily WHERE source = 'eastmoney'"
+    )
+    em_constituents = (
+        int(em_constituents_frame["n"].iloc[0])
+        if not em_constituents_frame.empty
+        else 0
+    )
+    print("[market_overview] 东财板块落库检查")
+    for kind in ("industry", "concept"):
+        matched = em_snapshot[em_snapshot["kind"] == kind]
+        count = int(matched["n"].iloc[0]) if not matched.empty else 0
+        print(f"  eastmoney-board-snapshot/{kind}: {count}")
+
+    if summary.get("warnings"):
+        print("[market_overview] 可选增强项降级（不阻断）：")
+        for key, message in summary["warnings"].items():
+            print(f"  {key}: {message}")
+
     if summary.get("errors"):
         print("[market_overview] 自检失败：存在数据源错误")
         for key, message in summary["errors"].items():
@@ -86,6 +115,12 @@ def main() -> None:
         raise SystemExit(1)
     if any(count <= 0 for count in required.values()):
         print("[market_overview] 自检失败：关键表为空")
+        raise SystemExit(1)
+    if set(em_snapshot["kind"]) != {"industry", "concept"}:
+        print("[market_overview] 自检失败：东财行业/概念快照未齐备")
+        raise SystemExit(1)
+    if em_constituents <= 0:
+        print("[market_overview] 自检失败：东财板块成分股为空")
         raise SystemExit(1)
     print("[market_overview] 自检通过")
 

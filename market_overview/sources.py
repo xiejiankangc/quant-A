@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,21 @@ def _cli_path() -> str:
 def run_cli(args: list[str], *, timeout: int = 240) -> dict[str, Any]:
     """运行 hithink-finance CLI，解析 JSON envelope，失败抛出 RuntimeError。"""
     exe = _cli_path()
+    last_error: RuntimeError | None = None
+    for attempt in range(4):
+        if attempt:
+            time.sleep(2 ** attempt)
+        try:
+            return _run_cli_once(exe, args, timeout)
+        except RuntimeError as exc:
+            last_error = exc
+            # 上游限流可重试；其他错误直接上抛。
+            if "FUYAO_429" not in str(exc):
+                raise
+    raise last_error or RuntimeError("hithink-finance 调用失败（未知原因）")
+
+
+def _run_cli_once(exe: str, args: list[str], timeout: int) -> dict[str, Any]:
     if os.name == "nt":
         command = subprocess.list2cmdline([exe, *[str(item) for item in args]])
         proc = subprocess.run(
@@ -228,6 +244,21 @@ def stock_snapshot(thscodes: list[str]) -> list[dict[str, Any]]:
 def stock_profile(symbol: str) -> dict[str, Any]:
     """东财个股补充信息：市值、股本与换手率。"""
     return em.stock_profile(symbol)
+
+
+def em_boards(kind: str) -> list[dict[str, Any]]:
+    """东财行业/概念板块列表（含当日涨跌幅、量、额、换手率）。"""
+    return em.boards(kind)
+
+
+def em_board_constituents(code: str) -> list[dict[str, Any]]:
+    """东财板块成分股（含市值、换手率、成交量额）。"""
+    return em.board_constituents(code)
+
+
+def em_board_history(code: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
+    """东财板块原生日线历史；部分 VPN 出口会风控 push2his，失败由调用方降级。"""
+    return em.board_history(code, start_date, end_date)
 
 
 def now_text() -> str:

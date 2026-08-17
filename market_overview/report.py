@@ -101,6 +101,14 @@ def render(
         "- 板块回撤为窗口内收盘相对前期最高点的最大跌幅；量能趋势基于成交额。"
     )
     lines.append(
+        "- 板块默认主源为东财行业/概念（代码 `EM:BKxxxx`），同花顺行业/概念为对照；"
+        "两套板块口径分别计算、不混算。"
+    )
+    lines.append(
+        "- 东财板块多日指标来自每日快照累计序列；东财原生日线接口受网络风控时，"
+        "不使用模拟值冒充历史。"
+    )
+    lines.append(
         "- 未抓取或计算失败的项目显示「-」或「不可用」，不使用模拟值。"
     )
     lines.append("")
@@ -153,56 +161,136 @@ def _render_boards(
         if not board_meta.empty
         else {}
     )
-    snapshot = board_daily[
-        board_daily["source"] == "hithink-index-snapshot"
+
+    sections: list[tuple[str, str, str, str | None]] = [
+        ("eastmoney-board-snapshot", "industry", "东财行业（默认主源）", None),
+        ("eastmoney-board-snapshot", "concept", "东财概念（默认主源）", None),
+        ("hithink-index-snapshot", "industry", "同花顺行业（对照）", "hithink-index-history"),
+        ("hithink-index-snapshot", "concept", "同花顺概念（对照）", "hithink-index-history"),
+    ]
+    for source, kind, title, history_source in sections:
+        _render_board_section(
+            lines,
+            board_daily,
+            names,
+            benchmark,
+            source,
+            kind,
+            title,
+            history_source,
+        )
+
+
+def _render_board_section(
+    lines: list[str],
+    board_daily: pd.DataFrame,
+    names: dict[str, str],
+    benchmark: pd.DataFrame,
+    source: str,
+    kind: str,
+    title: str,
+    history_source: str | None,
+) -> None:
+    """渲染单一来源/类别的板块章节：当日快照 + 多日强度/回撤。"""
+    frame = board_daily[
+        (board_daily["kind"] == kind) & (board_daily["source"] == source)
     ].copy()
-    if snapshot.empty:
-        snapshot = board_daily[
-            board_daily["trade_date"] == board_daily["trade_date"].max()
-        ].copy()
+    lines.append(f"### {title}")
+    lines.append("")
+    if frame.empty:
+        lines.append("> 暂无该来源板块数据。")
+        lines.append("")
+        return
+
+    depth = int(frame["trade_date"].nunique())
+    latest_date = str(frame["trade_date"].max())
+    lines.append(
+        f"> 数据来源：{source}；已累计 {depth} 个交易日快照/历史，最新 {latest_date}。"
+    )
+    lines.append("")
+
+    snapshot = (
+        frame[frame["trade_date"] == latest_date]
+        .drop_duplicates("thscode", keep="last")
+        .copy()
+    )
     snapshot["change_pct"] = pd.to_numeric(snapshot["change_pct"], errors="coerce")
     snapshot["amount"] = pd.to_numeric(snapshot["amount"], errors="coerce")
-    snapshot = snapshot.drop_duplicates("thscode", keep="last")
+    snapshot["turnover_rate_pct"] = pd.to_numeric(
+        snapshot["turnover_rate_pct"], errors="coerce"
+    )
     snapshot["name"] = snapshot["thscode"].map(names)
 
-    lines.append("### 当日板块快照（涨幅/跌幅前列）")
+    lines.append("#### 当日板块快照（涨幅前列 / 跌幅前列）")
     lines.append("")
     ordered = snapshot.sort_values("change_pct", ascending=False)
-    lines.append("| 板块 | 代码 | 涨跌幅 | 成交额 |")
-    lines.append("| --- | --- | --- | --- |")
+    lines.append("| 板块 | 代码 | 涨跌幅 | 成交额 | 换手率 |")
+    lines.append("| --- | --- | --- | --- | --- |")
     for _, row in ordered.head(10).iterrows():
         lines.append(
             f"| {row.get('name') or row.get('thscode')} | `{row.get('thscode')}` "
-            f"| {_fmt_pct(row.get('change_pct'))} | {_fmt_amount(row.get('amount'))} |"
+            f"| {_fmt_pct(row.get('change_pct'))} | {_fmt_amount(row.get('amount'))} "
+            f"| {_fmt_turnover(row.get('turnover_rate_pct'))} |"
         )
     for _, row in ordered.tail(10).iterrows():
         lines.append(
             f"| {row.get('name') or row.get('thscode')} | `{row.get('thscode')}` "
-            f"| {_fmt_pct(row.get('change_pct'))} | {_fmt_amount(row.get('amount'))} |"
+            f"| {_fmt_pct(row.get('change_pct'))} | {_fmt_amount(row.get('amount'))} "
+            f"| {_fmt_turnover(row.get('turnover_rate_pct'))} |"
         )
     lines.append("")
 
-    history_codes = board_daily[board_daily["source"] == "hithink-index-history"][
-        "thscode"
-    ].unique()
-    if len(history_codes) == 0:
-        lines.append("> 本报告未抓取板块历史明细，因此暂无多日强度/回撤列。")
+    if history_source is not None:
+        history_codes = board_daily[board_daily["source"] == history_source][
+            "thscode"
+        ].unique()
+        if len(history_codes) == 0:
+            lines.append("> 本报告未抓取同花顺板块历史明细，暂无多日强度/回撤列。")
+            lines.append("")
+            return
+        multi_frame = board_daily[board_daily["thscode"].isin(history_codes)]
+        _render_multi_day(lines, multi_frame, names, benchmark, None)
+    else:
+        _render_multi_day(lines, frame, names, benchmark, depth)
+
+
+def _render_multi_day(
+    lines: list[str],
+    frame: pd.DataFrame,
+    names: dict[str, str],
+    benchmark: pd.DataFrame,
+    snapshot_depth: int | None,
+) -> None:
+    """多日强度/回撤表；快照累计不足时如实说明，而不是输出空值冒充。"""
+    metrics = indicators.board_metrics(frame, benchmark, names)
+    if metrics.empty:
+        if snapshot_depth is not None:
+            lines.append(
+                f"> 东财板块快照仅累计 {snapshot_depth} 个交易日，"
+                "多日强度/回撤将在后续每日快照累计后自动可用；"
+                "本机东财原生日线历史接口（push2his）当前受网络风控，不作为默认主线。"
+            )
+            lines.append("")
+            return
+        lines.append("> 多日指标暂无法计算。")
         lines.append("")
         return
 
-    focused = board_daily[board_daily["thscode"].isin(history_codes)]
-    metrics = indicators.board_metrics(focused, benchmark, names)
-    lines.append("### 重点板块多日强度（5 日 / 20 日）")
+    lines.append("#### 重点板块多日强度（5 日 / 20 日）")
     lines.append("")
     for n in (5, 20):
-        subset = metrics[metrics["n"] == n].sort_values("relative", ascending=False)
+        subset = metrics[metrics["n"] == n]
         if subset.empty:
             continue
-        lines.append(f"#### {n} 日窗口")
+        subset = subset.sort_values("relative", ascending=False)
+        lines.append(f"##### {n} 日窗口")
         lines.append("")
         lines.append("| 板块 | 涨幅 | 相对基准 | 最大回撤 | 量能趋势 | 回撤类型 |")
         lines.append("| --- | --- | --- | --- | --- | --- |")
-        for _, row in subset.iterrows():
+        show = subset if snapshot_depth is None else pd.concat(
+            [subset.head(10), subset.tail(10)]
+        ).drop_duplicates()
+        for _, row in show.iterrows():
             lines.append(
                 f"| {row.get('name')} | {_fmt_pct(row.get('return'))} "
                 f"| {_fmt_pct(row.get('relative'))} | {_fmt_pct(row.get('max_drawdown'))} "
@@ -234,9 +322,15 @@ def _render_intra_board(lines: list[str], store: Store) -> None:
         if not board_meta.empty
         else {}
     )
-    for board_code, board_group in detail.groupby("board_thscode"):
+    board_codes = list(detail["board_thscode"].unique())
+    board_codes.sort(
+        key=lambda code: (0 if str(code).startswith("EM:") else 1, str(code))
+    )
+    for board_code in board_codes:
+        board_group = detail[detail["board_thscode"] == board_code]
         name = board_names.get(board_code, board_code)
-        lines.append(f"### {name or board_code}（`{board_code}`）")
+        provider = "东财" if str(board_code).startswith("EM:") else "同花顺"
+        lines.append(f"### {name or board_code}（{provider}）`{board_code}`")
         lines.append("")
         ordered = board_group.sort_values("relative_alpha", ascending=False)
         lines.append("| 个股 | 涨跌幅 | 相对板块 | 成交额占比 | 市值分组 | 地位 |")
@@ -430,6 +524,7 @@ def _render_data_status(lines: list[str], store: Store) -> None:
     log["fetched_at"] = pd.to_datetime(log["fetched_at"], errors="coerce")
     latest = log.sort_values("fetched_at").drop_duplicates("key", keep="last")
     errors = latest[latest["status"] == "error"]
+    warnings = latest[latest["status"] == "warn"]
     ok_count = int((latest["status"] == "ok").sum())
     lines.append(f"- 成功数据项：{ok_count}；失败数据项：{len(errors)}")
     if not errors.empty:
@@ -440,6 +535,40 @@ def _render_data_status(lines: list[str], store: Store) -> None:
             lines.append(
                 f"| `{row.get('key')}` | {(row.get('message') or '未知错误')[:240]} |"
             )
+    if not warnings.empty:
+        lines.append("")
+        lines.append("- 可选增强项降级（不阻断报告）：")
+        for _, row in warnings.iterrows():
+            lines.append(
+                f"  - `{row.get('key')}`：{(row.get('message') or '未知原因')[:240]}"
+            )
+    lines.append("")
+
+    depth_frame = store.query_df(
+        "SELECT kind, source, count(DISTINCT trade_date) AS depth "
+        "FROM board_daily GROUP BY kind, source ORDER BY kind, source"
+    )
+    if not depth_frame.empty:
+        lines.append("| 板块类别 | 数据来源 | 累计交易日 |")
+        lines.append("| --- | --- | --- |")
+        source_labels = {
+            "eastmoney-board-snapshot": "东财每日快照",
+            "eastmoney-board-history": "东财原生日线",
+            "hithink-index-snapshot": "同花顺快照",
+            "hithink-index-history": "同花顺日线",
+        }
+        kind_labels = {"industry": "行业", "concept": "概念"}
+        for _, row in depth_frame.iterrows():
+            lines.append(
+                f"| {kind_labels.get(str(row.get('kind')), row.get('kind'))} | "
+                f"{source_labels.get(str(row.get('source')), row.get('source'))} "
+                f"| {int(row.get('depth') or 0)} |"
+            )
+        lines.append("")
+    lines.append(
+        "> 东财板块多日指标默认由每日快照累计构建；原生日线历史仅在 "
+        "`--em-history` 下尝试，本机 push2his 受网络风控时会如实降级为警告。"
+    )
     lines.append("")
 
 

@@ -1,8 +1,11 @@
 """数据抓取编排：远端取数 -> 原始缓存 -> DuckDB 规范仓库。
 
 数据路由：
-- 指数目录/历史/快照、全市场快照、特色数据：同花顺 CLI；
-- 个股历史：东财不可用时走腾讯（akshare），来源字段如实标注；
+- 板块目录/快照/成分：东财行业+概念为默认主源，同花顺行业+概念保留为对照；
+- 板块多日历史：同花顺指数历史为主；东财原生日线受 push2his 风控限制，
+  多日指标改用「每日东财板块快照累计」自建序列，`--em-history` 可选尝试原生日线；
+- 指数目录/历史、全市场快照、特色数据：同花顺 CLI；
+- 个股历史：腾讯（akshare）为主，来源字段如实标注；
 - 个股市值/股本/换手率补充：东财 `market_data.em`。
 """
 
@@ -21,6 +24,9 @@ from .cache import Cache
 from .portfolio import Holding, Portfolio
 from .sources import (
     date_text,
+    em_board_constituents,
+    em_board_history,
+    em_boards,
     index_catalog,
     index_constituents,
     index_history,
@@ -62,6 +68,7 @@ def fetch_all(
     extra_symbols: tuple[str, ...] = (),
     include_breadth: bool = True,
     include_special: bool = True,
+    em_history: bool = False,
 ) -> dict[str, Any]:
     cache = Cache(cache_root)
     store = Store(store_path)
@@ -76,6 +83,8 @@ def fetch_all(
         "end_date": end_date,
         "artifacts": {},
         "errors": {},
+        "warnings": {},
+        "notes": {},
     }
 
     # 市场基准固定上证指数；组合基准默认沪深 300，另存供 β 使用。
@@ -151,7 +160,19 @@ def fetch_all(
     for kind in kinds:
         if kind not in ("industry", "concept"):
             raise ValueError(f"kinds 只支持 industry/concept，收到: {kind!r}")
-        _fetch_boards(
+        _fetch_eastmoney_boards(
+            cache,
+            store,
+            summary,
+            kind,
+            start_date,
+            end_date,
+            fetched_at,
+            focus_boards=focus_boards,
+            watch_boards=watch_boards,
+            em_history=em_history,
+        )
+        _fetch_ths_boards(
             cache,
             store,
             summary,
@@ -314,7 +335,310 @@ def _fetch_stock_profiles(
                 _record_error(store, summary, f"stock_profile:{symbol}", exc, fetched_at)
 
 
-def _fetch_boards(
+def _fetch_eastmoney_boards(
+    cache: Cache,
+    store: Store,
+    summary: dict[str, Any],
+    kind: str,
+    start_date: str,
+    end_date: str,
+    fetched_at: str,
+    *,
+    focus_boards: int,
+    watch_boards: tuple[str, ...],
+    em_history: bool,
+) -> None:
+    """东财行业/概念板块：目录 + 全量每日快照 + 重点板块成分（默认主源）。"""
+    try:
+        boards = em_boards(kind)
+    except Exception as exc:  # noqa: BLE001
+        _record_error(
+            store, summary, f"eastmoney_board_catalog:{kind}", exc, fetched_at
+        )
+        return
+
+    meta_rows = [
+        {
+            "thscode": _em_board_code(row["code"]),
+            "kind": kind,
+            "name": row.get("name"),
+            "source": "eastmoney-board",
+            "ingest_time": fetched_at,
+        }
+        for row in boards
+        if row.get("code")
+    ]
+    store.write_rows(
+        "board_meta",
+        meta_rows,
+        columns=["thscode", "kind", "name", "source", "ingest_time"],
+    )
+    cache.write_rows(
+        f"boards_em/{kind}/meta.jsonl",
+        boards,
+        meta={"kind": kind, "provider": "eastmoney", "fetched_at": fetched_at},
+    )
+    store.log(
+        f"eastmoney_board_catalog:{kind}",
+        "ok",
+        rows=len(meta_rows),
+        fetched_at=fetched_at,
+    )
+    summary["artifacts"][f"eastmoney_board_catalog_{kind}"] = {
+        "path": f"boards_em/{kind}/meta.jsonl",
+        "rows": len(meta_rows),
+    }
+
+    as_of = datetime.now(TZ).date().isoformat()
+    snapshot_rows = [
+        _em_board_snapshot_row(row, kind, as_of, fetched_at)
+        for row in boards
+        if row.get("code")
+    ]
+    store.write_rows(
+        "board_daily",
+        snapshot_rows,
+        columns=[
+            "trade_date",
+            "thscode",
+            "kind",
+            "close",
+            "change_pct",
+            "volume",
+            "amount",
+            "turnover_rate_pct",
+            "source",
+            "as_of",
+            "ingest_time",
+        ],
+    )
+    cache.write_rows(
+        f"boards_em/{kind}/snapshot.jsonl",
+        boards,
+        meta={
+            "kind": kind,
+            "provider": "eastmoney",
+            "as_of": as_of,
+            "fetched_at": fetched_at,
+        },
+    )
+    store.log(
+        f"eastmoney_board_snapshot:{kind}",
+        "ok",
+        rows=len(snapshot_rows),
+        fetched_at=fetched_at,
+    )
+    summary["artifacts"][f"eastmoney_board_snapshot_{kind}"] = {
+        "path": f"boards_em/{kind}/snapshot.jsonl",
+        "rows": len(snapshot_rows),
+    }
+
+    depth = _snapshot_depth(store, kind, "eastmoney-board-snapshot")
+    summary["notes"][f"eastmoney_{kind}_snapshot_depth"] = depth
+    if not em_history:
+        summary["notes"]["eastmoney_board_history"] = (
+            "未启用 --em-history；东财板块多日指标由每日快照累计构建，"
+            "原生日线历史接口在部分网络环境受风控"
+        )
+
+    focus = _select_em_focus_boards(boards, focus_boards, watch_boards)
+    for row in focus:
+        code = str(row["code"])
+        _fetch_em_board_detail(
+            cache,
+            store,
+            summary,
+            kind,
+            code,
+            str(row.get("name") or code),
+            start_date,
+            end_date,
+            fetched_at,
+            em_history=em_history,
+        )
+
+
+def _em_board_code(code: str) -> str:
+    """东财板块代码统一命名空间：EM:BKxxxx，与同花顺 thscode 区分。"""
+    value = str(code).strip().upper()
+    if value.startswith("90."):
+        value = value[3:]
+    if value.startswith("EM:"):
+        return value
+    if not value.startswith("BK"):
+        value = f"BK{value}"
+    return f"EM:{value}"
+
+
+def _select_em_focus_boards(
+    boards: list[dict[str, Any]],
+    focus_boards: int,
+    watch_boards: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """按当日涨跌幅绝对值取东财 Top N，并追加用户指定的代码/名称。"""
+    wanted: set[str] = set()
+    for token in watch_boards:
+        token = token.strip()
+        if not token:
+            continue
+        for row in boards:
+            code = str(row.get("code") or "")
+            name = str(row.get("name") or "")
+            if token in (code, f"EM:{code}", name):
+                wanted.add(code)
+                break
+
+    top = sorted(
+        boards,
+        key=lambda row: abs(_num(row.get("change_pct")) or 0.0),
+        reverse=True,
+    )[: max(0, focus_boards)]
+    selected = top + [row for row in boards if row.get("code") in wanted]
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for row in selected:
+        code = str(row.get("code"))
+        if code and code not in seen:
+            seen.add(code)
+            result.append(row)
+    return result
+
+
+def _fetch_em_board_detail(
+    cache: Cache,
+    store: Store,
+    summary: dict[str, Any],
+    kind: str,
+    code: str,
+    name: str,
+    start_date: str,
+    end_date: str,
+    fetched_at: str,
+    *,
+    em_history: bool,
+) -> None:
+    board_code = _em_board_code(code)
+
+    if em_history:
+        try:
+            history = em_board_history(code, start_date, end_date)
+            normalized = [
+                _em_board_history_row(row, kind, board_code, fetched_at)
+                for row in history
+                if row.get("date")
+            ]
+            store.write_rows(
+                "board_daily",
+                normalized,
+                columns=[
+                    "trade_date",
+                    "thscode",
+                    "kind",
+                    "close",
+                    "change_pct",
+                    "volume",
+                    "amount",
+                    "turnover_rate_pct",
+                    "source",
+                    "as_of",
+                    "ingest_time",
+                ],
+            )
+            cache.write_rows(
+                f"boards_em/{kind}/{code}/history.jsonl",
+                history,
+                meta={
+                    "code": code,
+                    "name": name,
+                    "fetched_at": fetched_at,
+                },
+            )
+            store.log(
+                f"eastmoney_board_history:{code}",
+                "ok",
+                rows=len(normalized),
+                fetched_at=fetched_at,
+            )
+            summary["artifacts"][f"eastmoney_board_history_{code}"] = {
+                "path": f"boards_em/{kind}/{code}/history.jsonl",
+                "rows": len(normalized),
+            }
+        except Exception as exc:  # noqa: BLE001 - 原生日线属可选增强，失败降级为警告
+            _record_warning(
+                store, summary, f"eastmoney_board_history:{code}", exc, fetched_at
+            )
+
+    try:
+        members = em_board_constituents(code)
+        as_of = datetime.now(TZ).date().isoformat()
+        rows = [
+            {
+                "as_of": as_of,
+                "board_thscode": board_code,
+                "symbol": str(member["symbol"]),
+                "name": member.get("name"),
+                "last_price": _num(member.get("price")),
+                "change_pct": (
+                    _num(member.get("change_pct")) / 100
+                    if _num(member.get("change_pct")) is not None
+                    else None
+                ),
+                "volume": _num(member.get("volume")),
+                "amount": _num(member.get("amount")),
+                "turnover_rate_pct": _num(member.get("turnover_rate")),
+                "total_market_cap": _num(member.get("total_market_cap")),
+                "float_market_cap": _num(member.get("float_market_cap")),
+                "source": "eastmoney",
+                "ingest_time": fetched_at,
+            }
+            for member in members
+            if member.get("symbol")
+        ]
+        store.write_rows(
+            "board_constituent_daily",
+            rows,
+            columns=[
+                "as_of",
+                "board_thscode",
+                "symbol",
+                "name",
+                "last_price",
+                "change_pct",
+                "volume",
+                "amount",
+                "turnover_rate_pct",
+                "total_market_cap",
+                "float_market_cap",
+                "source",
+                "ingest_time",
+            ],
+        )
+        cache.write_rows(
+            f"boards_em/{kind}/{code}/constituents.jsonl",
+            members,
+            meta={
+                "code": code,
+                "name": name,
+                "fetched_at": fetched_at,
+            },
+        )
+        store.log(
+            f"eastmoney_board_constituents:{code}",
+            "ok",
+            rows=len(rows),
+            fetched_at=fetched_at,
+        )
+        summary["artifacts"][f"eastmoney_board_constituents_{code}"] = {
+            "path": f"boards_em/{kind}/{code}/constituents.jsonl",
+            "rows": len(rows),
+        }
+    except Exception as exc:  # noqa: BLE001
+        _record_error(
+            store, summary, f"eastmoney_board_constituents:{code}", exc, fetched_at
+        )
+
+
+def _fetch_ths_boards(
     cache: Cache,
     store: Store,
     summary: dict[str, Any],
@@ -793,6 +1117,30 @@ def _record_error(
     store.log(key, "error", rows=0, message=message, fetched_at=fetched_at)
 
 
+def _record_warning(
+    store: Store,
+    summary: dict[str, Any],
+    key: str,
+    exc: Exception,
+    fetched_at: str,
+) -> None:
+    """可选增强项失败：记录警告但不阻断整体流程。"""
+    message = f"{type(exc).__name__}: {exc}"
+    summary["warnings"][key] = message
+    store.log(key, "warn", rows=0, message=message, fetched_at=fetched_at)
+
+
+def _snapshot_depth(store: Store, kind: str, source: str) -> int:
+    """统计某来源/类别的板块快照已累计多少个交易日。"""
+    with store.connect() as con:
+        depth = con.execute(
+            "SELECT count(DISTINCT trade_date) AS depth FROM board_daily "
+            "WHERE kind = ? AND source = ?",
+            [kind, source],
+        ).fetchone()
+    return int(depth[0]) if depth else 0
+
+
 def _board_name(catalog: list[dict[str, Any]], code: str) -> str:
     for row in catalog:
         if str(row.get("thscode")) == code:
@@ -910,6 +1258,51 @@ def _board_history_row(
         "amount": _num(row.get("turnover")),
         "turnover_rate_pct": None,
         "source": "hithink-index-history",
+        "as_of": trade_date,
+        "ingest_time": fetched_at,
+    }
+
+
+def _em_board_snapshot_row(
+    row: dict[str, Any],
+    kind: str,
+    as_of: str,
+    fetched_at: str,
+) -> dict[str, Any]:
+    change_pct = _num(row.get("change_pct"))
+    return {
+        "trade_date": as_of,
+        "thscode": _em_board_code(row["code"]),
+        "kind": kind,
+        "close": _num(row.get("price")),
+        "change_pct": change_pct / 100 if change_pct is not None else None,
+        "volume": _num(row.get("volume")),
+        "amount": _num(row.get("amount")),
+        "turnover_rate_pct": _num(row.get("turnover_rate")),
+        "source": "eastmoney-board-snapshot",
+        "as_of": as_of,
+        "ingest_time": fetched_at,
+    }
+
+
+def _em_board_history_row(
+    row: dict[str, Any],
+    kind: str,
+    board_code: str,
+    fetched_at: str,
+) -> dict[str, Any]:
+    trade_date = str(row["date"])[:10]
+    change_pct = _num(row.get("change_pct"))
+    return {
+        "trade_date": trade_date,
+        "thscode": board_code,
+        "kind": kind,
+        "close": _num(row.get("close")),
+        "change_pct": change_pct / 100 if change_pct is not None else None,
+        "volume": _num(row.get("volume")),
+        "amount": _num(row.get("amount")),
+        "turnover_rate_pct": _num(row.get("turnover_rate")),
+        "source": "eastmoney-board-history",
         "as_of": trade_date,
         "ingest_time": fetched_at,
     }
