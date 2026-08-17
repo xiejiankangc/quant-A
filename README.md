@@ -7,9 +7,13 @@ A 股行情接入，支持双机各自克隆、各自搭建环境与构建。
 | 路径 | 说明 |
 | --- | --- |
 | `market_data/em.py` | 东方财富行情访问层：实时线 → 延迟线自动降级，并按「系统代理 → 直连 → curl」逐层回退 |
+| `market_data/tx.py` | 腾讯日线历史访问层：东财历史接口受 VPN 风控时的稳健回退 |
 | `scripts/verify_market_data.py` | 双通道自检脚本：东财行情（失败回退腾讯逐笔）+ 同花顺 fuyao REST |
-| `market_overview/` | 市场概览与板块变化追踪：M0 已提供抓取层、本地缓存与报告骨架 |
-| `examples/portfolio.sample.json` | 组合输入格式样例（代码 + 权重，缺省基准上证指数、窗口 60 交易日） |
+| `scripts/verify_market_overview.py` | 市场全景系统端到端自检：抓取、落库、报告与关键表检查 |
+| `market_overview/` | 市场全景辅助决策系统：数据抓取、DuckDB 规范仓库、指标计算与报告 |
+| `examples/portfolio.sample.json` | 组合输入格式样例：权重输入，基准沪深 300、窗口 120 交易日 |
+| `examples/portfolio.shares.sample.json` | 组合输入格式样例：股数输入，按最新价自动折算权重 |
+| `docs/requirements/market-overview.md` | 需求基线：分层模型、功能需求、指标口径与里程碑 |
 | `requirements.txt` | 直接依赖（精确版本） |
 | `requirements.lock` | 完整依赖锁定（`pip freeze` 产物，可复现构建用） |
 | `.python-version` | 目标 Python 版本 |
@@ -120,25 +124,33 @@ env_http_headers = { "X-api-key" = "HITHINK_FINANCE_API_KEY" }
 
 ```powershell
 python scripts/verify_market_data.py 600519   # akshare + fuyao 双通道行情
+python scripts/verify_market_overview.py --portfolio examples\portfolio.sample.json
 hithink-finance symbol search --q 600519 --limit 1 --format json
 hithink-finance doctor --format json
 ```
 
-## 市场概览跟踪（M0 骨架）
+## 市场全景辅助决策
 
-先抓取再渲染报告；缓存与报告都落在不入库的 `data/` 目录：
+先初始化本地 DuckDB 规范仓库，再抓取数据，最后渲染报告。缓存、仓库与报告都落在
+不入库的 `data/` 目录：
 
 ```powershell
-python -m market_overview fetch --portfolio examples\portfolio.sample.json --data-dir data\cache
-python -m market_overview report --portfolio examples\portfolio.sample.json --data-dir data\cache --out data\reports\market_overview.md
+python -m market_overview init --db data\market_overview.duckdb
+python -m market_overview fetch --portfolio examples\portfolio.sample.json --db data\market_overview.duckdb --data-dir data\cache
+python -m market_overview report --portfolio examples\portfolio.sample.json --db data\market_overview.duckdb --out data\reports\market_overview.md
+python -m market_overview status --db data\market_overview.duckdb
 ```
 
-- `fetch` 默认抓 60 交易日窗口的上证指数日线、东财行业/概念板块列表、涨跌幅
-  最大的板块明细样例，以及组合内个股的后复权日线和市值/换手率补充信息；
-- `report` 从缓存渲染 Markdown 报告，抓取失败的条目会如实列在「抓取状态」；
-- 组合 JSON 格式见 `examples/portfolio.sample.json`，权重合计必须为 1；
-- 东财板块历史走 `push2his.eastmoney.com`，部分 VPN 出口会风控该域名；失败
-  不影响其余数据落盘，报告中会保留原因。
+- `fetch` 默认抓 120 交易日窗口的上证指数与组合基准、同花顺行业/概念指数目录
+  与全板块快照、重点板块历史与成分、组合个股日线，以及全市场宽度和涨停/炸板/
+  连板数据；
+- `--watch-boards 881273.TI` 可强制跟踪指定板块；`--focus-boards N` 控制按当日
+  涨跌幅绝对值选取的重点板块数量；
+- `report` 从 DuckDB 计算市场、板块、板块内个股、个股与组合五层指标；失败项
+  在「数据状态」中如实列出；
+- 组合 JSON 支持权重、股数、市值三种输入；权重输入合计必须为 1；
+- 个股历史优先同花顺，本地库不可用时回退腾讯；板块历史走同花顺指数接口，东财
+  板块历史因部分 VPN 出口被风控仅保留为可选对照。
 
 ## 网络环境注意（机器级配置，不入库）
 

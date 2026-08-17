@@ -1,5 +1,9 @@
 # 市场整体概览与板块变化追踪（设计草案）
 
+> 注意：本文件已被
+> `docs/requirements/market-overview.md`（v1.0-draft）取代为需求基线。
+> 本文件降级为数据源验证记录，保留已实测字段与数据缺口结论。
+
 > 分支：`feature/market-overview-sector-tracking`
 > 状态：草案 v0.3（板块体系定为东财行业+概念，无地域；其余同 v0.2）
 

@@ -375,6 +375,70 @@ def board_history(
     raise EastMoneyUnavailable(f"板块历史 {board_code} -> {'; '.join(failures)}")
 
 
+def stock_history(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    adjust: str = "forward",
+) -> list[dict[str, Any]]:
+    """单只 A 股日线历史，作为同花顺本地库不可用时的东财回退通道。
+
+    adjust 取值：forward / backward / none；对应东财 fqt=1 / 2 / 0。
+    返回字段与 board_history 一致，另加 symbol。
+    """
+    code = str(symbol).strip()
+    if not (code.isdigit() and len(code) == 6):
+        raise ValueError(f"股票代码需要是 6 位数字，收到: {symbol!r}")
+    fqt = {"forward": 1, "backward": 2, "none": 0}.get(adjust)
+    if fqt is None:
+        raise ValueError(f"adjust 只支持 forward/backward/none，收到: {adjust!r}")
+
+    params = {
+        "secid": _secid(code),
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "101",
+        "fqt": str(fqt),
+        "beg": start_date.replace("-", ""),
+        "end": end_date.replace("-", ""),
+    }
+    failures: list[str] = []
+    for attempt in range(2):
+        try:
+            data, transport = fetch(f"{HISTORY_HOST}/api/qt/stock/kline/get", params)
+            payload = (data or {}).get("data")
+            if not payload:
+                raise EastMoneyUnavailable(f"个股历史返回缺少 data: {code}")
+            rows = []
+            for line in payload.get("klines") or []:
+                parts = line.split(",")
+                if len(parts) < 11:
+                    continue
+                rows.append(
+                    {
+                        "symbol": code,
+                        "date": parts[0],
+                        "open": _num(parts[1]),
+                        "close": _num(parts[2]),
+                        "high": _num(parts[3]),
+                        "low": _num(parts[4]),
+                        "volume": _num(parts[5]),
+                        "amount": _num(parts[6]),
+                        "amplitude": _num(parts[7]),
+                        "change_pct": _num(parts[8]),
+                        "change": _num(parts[9]),
+                        "turnover_rate": _num(parts[10]),
+                        "transport": transport,
+                    }
+                )
+            return rows
+        except Exception as exc:  # noqa: BLE001 - 重试需要收集原因
+            failures.append(f"attempt{attempt}: {type(exc).__name__}")
+            time.sleep(1)
+    raise EastMoneyUnavailable(f"个股历史 {code} -> {'; '.join(failures)}")
+
+
 def board_constituents(code: str) -> list[dict[str, Any]]:
     """东财板块成分股。
 

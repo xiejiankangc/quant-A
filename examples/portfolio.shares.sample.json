@@ -1,23 +1,22 @@
 {
-  "name": "示例组合",
+  "name": "股数输入示例",
   "benchmark": "000300.SH",
   "window_days": 120,
   "holdings": [
     {
       "symbol": "600519",
       "name": "贵州茅台",
-      "weight": 0.4
+      "shares": 100
     },
     {
       "symbol": "300750",
       "name": "宁德时代",
-      "weight": 0.35
+      "shares": 200
     },
     {
       "symbol": "601318",
       "name": "中国平安",
-      "weight": 0.25
+      "shares": 1000
     }
   ]
 }
-
