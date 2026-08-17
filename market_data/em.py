@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlencode
@@ -26,6 +27,8 @@ import requests
 
 REALTIME_HOST = "https://push2.eastmoney.com"
 DELAYED_HOST = "https://push2delay.eastmoney.com"
+# 历史 K 线只有 push2his 提供；部分 VPN 出口会风控该域名，失败时如实报错。
+HISTORY_HOST = "https://push2his.eastmoney.com"
 
 _HEADERS = {
     "User-Agent": (
@@ -224,3 +227,209 @@ def diagnose() -> None:
             print(f"  [OK] {label:8s} {host} (via {transport})")
         except EastMoneyUnavailable as exc:
             print(f"  [--] {label:8s} {host} 不可用 ({exc})")
+
+
+def _num(value: Any) -> float | None:
+    """把东财字段里的 `-` / 空串 / None 统一转成 None，其余转 float。"""
+    if value in (None, "", "-"):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_board_code(code: str) -> str:
+    """把 BKxxxx / 90.BKxxxx 等写法统一成 BKxxxx。"""
+    code = str(code).strip().upper()
+    if code.startswith("90."):
+        code = code[3:]
+    if not code.startswith("BK"):
+        code = f"BK{code}"
+    return code
+
+
+def _clist(
+    fs: str,
+    fields: str,
+    *,
+    fid: str = "f12",
+    page_size: int = 100,
+) -> list[dict[str, Any]]:
+    """分页拉取东财 clist 接口；实时线失败自动换延迟线。"""
+    failures: list[str] = []
+    for host, delayed in [(REALTIME_HOST, False), (DELAYED_HOST, True)]:
+        try:
+            rows: list[dict[str, Any]] = []
+            page = 1
+            while True:
+                params = {
+                    "pn": page,
+                    "pz": page_size,
+                    "po": 1,
+                    "np": 1,
+                    "fltt": 2,
+                    "invt": 2,
+                    "fid": fid,
+                    "fs": fs,
+                    "fields": fields,
+                }
+                data, transport = fetch(f"{host}/api/qt/clist/get", params)
+                payload = (data or {}).get("data")
+                if not payload:
+                    raise EastMoneyUnavailable("clist 返回缺少 data")
+                total = int(payload.get("total") or 0)
+                diff = payload.get("diff") or []
+                for item in diff:
+                    row = dict(item)
+                    row["_delayed"] = delayed
+                    row["_transport"] = transport
+                    rows.append(row)
+                if not diff or (total and len(rows) >= total):
+                    break
+                page += 1
+            return rows
+        except Exception as exc:  # noqa: BLE001 - 逐层降级需要收集全部原因
+            failures.append(f"{host}: {type(exc).__name__}")
+    raise EastMoneyUnavailable(f"clist fs={fs} -> {'; '.join(failures)}")
+
+
+def boards(kind: str) -> list[dict[str, Any]]:
+    """东财行业/概念板块列表。
+
+    kind 只接受 `industry`（行业板块）或 `concept`（概念板块）。
+    返回字段：code/name/price/change_pct/amount/turnover_rate/delayed/transport。
+    """
+    fs = {"industry": "m:90+t:2+f:!50", "concept": "m:90+t:3+f:!50"}.get(kind)
+    if fs is None:
+        raise ValueError(f"kind 只支持 industry/concept，收到: {kind!r}")
+    rows = _clist(fs, "f12,f14,f2,f3,f6,f8")
+    return [
+        {
+            "code": row.get("f12"),
+            "name": row.get("f14"),
+            "price": _num(row.get("f2")),
+            "change_pct": _num(row.get("f3")),
+            "amount": _num(row.get("f6")),
+            "turnover_rate": _num(row.get("f8")),
+            "delayed": row.get("_delayed"),
+            "transport": row.get("_transport"),
+        }
+        for row in rows
+    ]
+
+
+def board_history(
+    code: str,
+    start_date: str,
+    end_date: str,
+) -> list[dict[str, Any]]:
+    """东财板块日线历史（前复权）。
+
+    code 接受 BKxxxx 或 90.BKxxxx；start/end 为 YYYY-MM-DD。
+    返回字段：date/open/close/high/low/volume/amount/amplitude/
+    change_pct/change/turnover_rate。
+    """
+    board_code = _normalize_board_code(code)
+    params = {
+        "secid": f"90.{board_code}",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "101",
+        "fqt": "1",
+        "beg": start_date.replace("-", ""),
+        "end": end_date.replace("-", ""),
+    }
+    failures: list[str] = []
+    for attempt in range(2):
+        try:
+            data, transport = fetch(f"{HISTORY_HOST}/api/qt/stock/kline/get", params)
+            payload = (data or {}).get("data")
+            if not payload:
+                raise EastMoneyUnavailable(f"板块历史返回缺少 data: {board_code}")
+            rows = []
+            for line in payload.get("klines") or []:
+                parts = line.split(",")
+                if len(parts) < 11:
+                    continue
+                rows.append(
+                    {
+                        "date": parts[0],
+                        "open": _num(parts[1]),
+                        "close": _num(parts[2]),
+                        "high": _num(parts[3]),
+                        "low": _num(parts[4]),
+                        "volume": _num(parts[5]),
+                        "amount": _num(parts[6]),
+                        "amplitude": _num(parts[7]),
+                        "change_pct": _num(parts[8]),
+                        "change": _num(parts[9]),
+                        "turnover_rate": _num(parts[10]),
+                        "transport": transport,
+                    }
+                )
+            return rows
+        except Exception as exc:  # noqa: BLE001 - 重试需要收集原因
+            failures.append(f"attempt{attempt}: {type(exc).__name__}")
+            time.sleep(1)
+    raise EastMoneyUnavailable(f"板块历史 {board_code} -> {'; '.join(failures)}")
+
+
+def board_constituents(code: str) -> list[dict[str, Any]]:
+    """东财板块成分股。
+
+    返回字段：symbol/name/price/change_pct/volume/amount/turnover_rate/
+    total_market_cap/float_market_cap。
+    """
+    board_code = _normalize_board_code(code)
+    rows = _clist(f"b:{board_code}+f:!50", "f12,f14,f2,f3,f5,f6,f8,f20,f21", fid="f3")
+    return [
+        {
+            "symbol": row.get("f12"),
+            "name": row.get("f14"),
+            "price": _num(row.get("f2")),
+            "change_pct": _num(row.get("f3")),
+            "volume": _num(row.get("f5")),
+            "amount": _num(row.get("f6")),
+            "turnover_rate": _num(row.get("f8")),
+            "total_market_cap": _num(row.get("f20")),
+            "float_market_cap": _num(row.get("f21")),
+            "delayed": row.get("_delayed"),
+            "transport": row.get("_transport"),
+        }
+        for row in rows
+    ]
+
+
+def stock_profile(symbol: str) -> dict[str, Any]:
+    """单只 A 股补充信息：市值、股本与换手率。"""
+    params = {
+        "secid": _secid(symbol),
+        "fields": "f43,f47,f48,f57,f58,f84,f85,f116,f117,f168",
+        "fltt": 2,
+        "invt": 2,
+    }
+    last_error: Exception | None = None
+    for host, delayed in [(REALTIME_HOST, False), (DELAYED_HOST, True)]:
+        try:
+            data, transport = fetch(f"{host}/api/qt/stock/get", params)
+            payload = (data or {}).get("data") or {}
+            if not payload or payload.get("f57") != symbol:
+                raise EastMoneyUnavailable(f"返回缺少个股信息字段: {symbol}")
+            return {
+                "symbol": payload.get("f57"),
+                "name": payload.get("f58"),
+                "price": _num(payload.get("f43")),
+                "volume": _num(payload.get("f47")),
+                "amount": _num(payload.get("f48")),
+                "total_shares": _num(payload.get("f84")),
+                "float_shares": _num(payload.get("f85")),
+                "total_market_cap": _num(payload.get("f116")),
+                "float_market_cap": _num(payload.get("f117")),
+                "turnover_rate": _num(payload.get("f168")),
+                "delayed": delayed,
+                "transport": transport,
+            }
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+    raise EastMoneyUnavailable(f"stock_profile({symbol}) 全部通道失败: {last_error}")

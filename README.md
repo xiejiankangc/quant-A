@@ -8,6 +8,8 @@ A 股行情接入，支持双机各自克隆、各自搭建环境与构建。
 | --- | --- |
 | `market_data/em.py` | 东方财富行情访问层：实时线 → 延迟线自动降级，并按「系统代理 → 直连 → curl」逐层回退 |
 | `scripts/verify_market_data.py` | 双通道自检脚本：东财行情（失败回退腾讯逐笔）+ 同花顺 fuyao REST |
+| `market_overview/` | 市场概览与板块变化追踪：M0 已提供抓取层、本地缓存与报告骨架 |
+| `examples/portfolio.sample.json` | 组合输入格式样例（代码 + 权重，缺省基准上证指数、窗口 60 交易日） |
 | `requirements.txt` | 直接依赖（精确版本） |
 | `requirements.lock` | 完整依赖锁定（`pip freeze` 产物，可复现构建用） |
 | `.python-version` | 目标 Python 版本 |
@@ -121,6 +123,22 @@ python scripts/verify_market_data.py 600519   # akshare + fuyao 双通道行情
 hithink-finance symbol search --q 600519 --limit 1 --format json
 hithink-finance doctor --format json
 ```
+
+## 市场概览跟踪（M0 骨架）
+
+先抓取再渲染报告；缓存与报告都落在不入库的 `data/` 目录：
+
+```powershell
+python -m market_overview fetch --portfolio examples\portfolio.sample.json --data-dir data\cache
+python -m market_overview report --portfolio examples\portfolio.sample.json --data-dir data\cache --out data\reports\market_overview.md
+```
+
+- `fetch` 默认抓 60 交易日窗口的上证指数日线、东财行业/概念板块列表、涨跌幅
+  最大的板块明细样例，以及组合内个股的后复权日线和市值/换手率补充信息；
+- `report` 从缓存渲染 Markdown 报告，抓取失败的条目会如实列在「抓取状态」；
+- 组合 JSON 格式见 `examples/portfolio.sample.json`，权重合计必须为 1；
+- 东财板块历史走 `push2his.eastmoney.com`，部分 VPN 出口会风控该域名；失败
+  不影响其余数据落盘，报告中会保留原因。
 
 ## 网络环境注意（机器级配置，不入库）
 
